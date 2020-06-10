@@ -1,61 +1,125 @@
 "Encoding music21 streams -> numpy array -> text"
 
-# import re
+import re
+from pathlib import Path
 import music21
 import numpy as np
-# from pathlib import Path
+from .midi_data import file2stream
+from fastai.text.data import BOS
+import scipy.sparse
+from collections import defaultdict
+from math import ceil
 
-BPB = 4 # beats per bar
-TIMESIG = f'{BPB}/4' # default time signature
+TIMESIG = '4/4' # default time signature
 PIANO_RANGE = (21, 108)
 VALTSEP = -1 # separator value for numpy encoding
-VALTCONT = -2 # numpy value for TCONT - needed for compressing chord array
+VALTSTART = -1 # numpy value for TSTART
+VALTCONT = -2 # numpy value for TCONT
 
-SAMPLE_FREQ = 4
-NOTE_SIZE = 128
-DUR_SIZE = (10*BPB*SAMPLE_FREQ)+1 # Max length - 8 bars. Or 16 beats/quarternotes
-MAX_NOTE_DUR = (8*BPB*SAMPLE_FREQ)
+
+NPRE = 'n' # note value encoding prefix
+OPRE = 'o' # octave encoding prefix
+IPRE = 'i' # instrument encoding prefix
+TPRE = 't' # note type encoding prefix - negative means duration encoded
 
 # Encoding process
 # 1. midi -> music21.Stream
 # 2. Stream -> numpy chord array (timestep X instrument X noterange)
 # 3. numpy array -> List[Timestep][NoteEnc]
-def midi2npenc(midi_file, skip_last_rest=True):
-    "Converts midi file to numpy encoding for language model"
-    stream = file2stream(midi_file) # 1.
-    chordarr = stream2chordarr(stream) # 2.
-    return chordarr2npenc(chordarr, skip_last_rest=skip_last_rest) # 3.
+# 4. NoteEnc -> string
 
 # Decoding process
-# 1. NoteEnc -> numpy chord array
-# 2. numpy array -> music21.Stream
-def npenc2stream(arr, bpm=120):
-    "Converts numpy encoding to music21 stream"
-    chordarr = npenc2chordarr(np.array(arr)) # 1.
-    return chordarr2stream(chordarr, bpm=bpm) # 2.
+# 1. string -> NoteEnc
+# 2. NoteEnc -> numpy array
+# 3. numpy array -> music21.Stream
+# 4. Stream -> midi
+
+class NoteEnc():
+    # dur = note start/continue, note = midi value, inst = instrument
+    def __init__(self, note, dur, inst=None):
+        assert(dur != 0)
+        self.note,self.dur,self.inst = note,int(dur),inst
+        if self.inst is not None: self.inst = str(self.inst)
+            
+    @property
+    def pitch(self):
+        return music21.pitch.Pitch(self.note)
+    
+    # continuous format is -1 for note strike, -2 for note continued
+    def continuous_repr(self, short=True, instrument=False):
+        dur = self.dur if self.dur == VALTCONT else VALTSTART
+        tname = f'{TPRE}{dur}' # ts=note start, tc=note continue
+        if short: 
+            nname = NPRE + self.pitch.nameWithOctave
+            return [nname, tname]
+        nname = NPRE + self.pitch.name
+        oname = OPRE + str(self.pitch.octave)
+        if instrument:
+            iname = IPRE+self.inst
+            return [nname,oname,tname,iname]
+        return [nname,oname,tname]
+    
+    # duration format is tX for note duration, Return nothing if continued note
+    def duration_repr(self, short=True, instrument=False):
+        if self.dur == VALTCONT: return []
+        tname = f'{TPRE}{self.dur}'
+        if short: 
+            nname = NPRE + self.pitch.nameWithOctave
+            return [nname, tname]
+        nname = NPRE + self.pitch.name
+        oname = OPRE + str(self.pitch.octave)
+        if instrument:
+            iname = IPRE+self.inst
+            return [nname,oname,tname,iname]
+        return [nname,oname,tname]
+    
+#     def joined_repr(self):
+#         # returns something like 'nG:o2:ts:i1'
+#         return NOTE_SEP.join(self.long_comp())
+    
+    def __repr__(self):
+        kname = self.pitch.nameWithOctave
+        tname = f'{TPRE}{self.dur}' # ts=note start, tc=note continue
+        return kname+tname
+    
+    def ival(self): # instrument number value
+        if self.inst is None: return 0
+        return int(self.inst)
+    
+    def m21_note(self):
+        return music21.note.Note(self.note)
+        
+    @classmethod
+    def parse_arr(self, arr):
+        kv = {s[0]:s[1:] for s in arr if s}
+        if NPRE not in kv: return None
+        note = kv[NPRE]
+        if OPRE in kv: note += kv[OPRE]
+        dur = int(kv[TPRE])
+        assert(re.fullmatch(RENOTE, note))
+        return NoteEnc(note=note, dur=dur, inst=kv.get(IPRE))
 
 ##### ENCODING ######
 
-# 1. File To STream
-
-def file2stream(fp):
-    if isinstance(fp, music21.midi.MidiFile): return music21.midi.translate.midiFileToStream(fp)
-    return music21.converter.parse(fp)
+def midi2seq(midi_file):
+    "Converts midi file to string representation for language model"
+    stream = file2stream(midi_file) # 1.
+    s_arr = stream2chordarr(stream) # 2.
+    return chordarr2seq(s_arr) # 3.
 
 # 2.
-def stream2chordarr(s, note_size=NOTE_SIZE, sample_freq=SAMPLE_FREQ, max_note_dur=MAX_NOTE_DUR):
+def stream2chordarr(s, note_range=128, sample_freq=4, max_dur=None):
     "Converts music21.Stream to 1-hot numpy array"
     # assuming 4/4 time
     # note x instrument x pitch
     # FYI: midi middle C value=60
     
     # (AS) TODO: need to order by instruments most played and filter out percussion or include the channel
-    highest_time = max(s.flat.getElementsByClass('Note').highestTime, s.flat.getElementsByClass('Chord').highestTime)
-    maxTimeStep = round(highest_time * sample_freq)+1
-    score_arr = np.zeros((maxTimeStep, len(s.parts), NOTE_SIZE))
+    maxTimeStep = int(s.flat.highestTime * sample_freq)+1
+    score_arr = np.zeros((maxTimeStep, len(s.parts), note_range))
 
     def note_data(pitch, note):
-        return (pitch.midi, int(round(note.offset*sample_freq)), int(round(note.duration.quarterLength*sample_freq)))
+        return (pitch.midi, round(note.offset*sample_freq), round(note.duration.quarterLength*sample_freq))
 
     for idx,part in enumerate(s.parts):
         notes=[]
@@ -71,115 +135,132 @@ def stream2chordarr(s, note_size=NOTE_SIZE, sample_freq=SAMPLE_FREQ, max_note_du
         for n in notes_sorted:
             if n is None: continue
             pitch,offset,duration = n
-            if max_note_dur is not None and duration > max_note_dur: duration = max_note_dur
+            if max_dur is not None and duration > max_dur: duration = max_dur
             score_arr[offset, idx, pitch] = duration
             score_arr[offset+1:offset+duration, idx, pitch] = VALTCONT      # Continue holding note
     return score_arr
 
-def chordarr2npenc(chordarr, skip_last_rest=True):
-    # combine instruments
-    result = []
-    wait_count = 0
-    for idx,timestep in enumerate(chordarr):
-        flat_time = timestep2npenc(timestep)
-        if len(flat_time) == 0:
-            wait_count += 1
-        else:
-            # pitch, octave, duration, instrument
-            if wait_count > 0: result.append([VALTSEP, wait_count])
-            result.extend(flat_time)
-            wait_count = 1
-    if wait_count > 0 and not skip_last_rest: result.append([VALTSEP, wait_count])
-    return np.array(result, dtype=int).reshape(-1, 2) # reshaping. Just in case result is empty
+def compress_chordarr(chordarr):
+    return shorten_chordarr_rests(trim_chordarr_rests(chordarr))
 
-# Note: not worrying about overlaps - as notes will still play. just look tied
-# http://web.mit.edu/music21/doc/moduleReference/moduleStream.html#music21.stream.Stream.getOverlaps
-def timestep2npenc(timestep, note_range=PIANO_RANGE, enc_type=None):
-    # inst x pitch
-    notes = []
-    for i,n in zip(*timestep.nonzero()):
-        d = timestep[i,n]
-        if d < 0: continue # only supporting short duration encoding for now
-        if n < note_range[0] or n >= note_range[1]: continue # must be within midi range
-        notes.append([n,d,i])
+def trim_chordarr_rests(arr, max_rests=16):
+    start_idx = 0
+    for idx,t in enumerate(arr):
+        if t.sum() != 0: break
+        start_idx = idx+1
         
-    notes = sorted(notes, key=lambda x: x[0], reverse=True) # sort by note (highest to lowest)
-    
-    if enc_type is None: 
-        # note, duration
-        return [n[:2] for n in notes] 
-    if enc_type == 'parts':
-        # note, duration, part
-        return [n for n in notes]
-    if enc_type == 'full':
-        # note_class, duration, octave, instrument
-        return [[n%12, d, n//12, i] for n,d,i in notes] 
+    end_idx = 0
+    for idx,t in enumerate(reversed(arr)):
+        if t.sum() != 0: break
+        end_idx = idx+1
+    start_idx = start_idx - start_idx % max_rests
+    end_idx = end_idx - end_idx % max_rests
+#     if start_idx > 0 or end_idx > 0: print('Trimming rests. Start, end:', start_idx, len(arr)-end_idx, end_idx)
+    return arr[start_idx:(len(arr)-end_idx)]
+
+def shorten_chordarr_rests(arr, max_rests=32):
+    rest_count = 0
+    result = []
+    for timestep in arr:
+        if timestep.sum() == 0: 
+            rest_count += 1
+        else:
+            if rest_count > max_rests+4:
+                old_count = rest_count
+                rest_count = rest_count % 4 + max_rests
+#                 print(f'Compressing rests: {old_count} -> {rest_count}')
+            for i in range(rest_count): result.append(np.zeros(timestep.shape))
+            rest_count = 0
+            result.append(timestep)
+    for i in range(rest_count): result.append(np.zeros(timestep.shape))
+    return np.array(result)
+
+# 3a.
+def chordarr2seq(score_arr):
+    # note x instrument x pitch
+    return [timestep2seq(t) for t in score_arr]
+
+# 3b.
+def timestep2seq(timestep):
+    # int x pitch
+    notes = [NoteEnc(n,timestep[i,n],i) for i,n in zip(*timestep.nonzero())]
+    sorted_keys = sorted(notes, key=lambda x: x.pitch, reverse=True)
+    return sorted_keys
 
 ##### DECODING #####
 
-# 1.
-def npenc2chordarr(npenc, note_size=NOTE_SIZE):
-    num_instruments = 1 if len(npenc.shape) <= 2 else npenc.max(axis=0)[-1]
-    
-    max_len = npenc_len(npenc)
-    # score_arr = (steps, inst, note)
-    score_arr = np.zeros((max_len, num_instruments, note_size))
-    
-    idx = 0
-    for step in npenc:
-        n,d,i = (step.tolist()+[0])[:3] # or n,d,i
-        if n < VALTSEP: continue # special token
-        if n == VALTSEP:
-            idx += d
-            continue
-        score_arr[idx,i,n] = d
+# 2.
+def seq2chordarr(seq, note_range=128): # 128 = default midi range
+    num_parts = max([n.ival() for t in seq for n in t]) + 1
+    score_arr = np.zeros((len(seq), num_parts, note_range))
+    for idx,ts in enumerate(seq):
+        for note in ts:
+            score_arr[idx,note.ival(),note.pitch.midi] = note.dur
     return score_arr
 
-def npenc_len(npenc):
-    duration = 0
-    for t in npenc:
-        if t[0] == VALTSEP: duration += t[1]
-    return duration + 1
-
-
-# 2.
-def chordarr2stream(arr, sample_freq=SAMPLE_FREQ, bpm=120):
+# 3.
+def chordarr2stream(arr, sample_freq=4, bpm=120):
     duration = music21.duration.Duration(1. / sample_freq)
-    stream = music21.stream.Score()
+    stream = music21.stream.Stream()
     stream.append(music21.meter.TimeSignature(TIMESIG))
     stream.append(music21.tempo.MetronomeMark(number=bpm))
     stream.append(music21.key.KeySignature(0))
     for inst in range(arr.shape[1]):
-        p = partarr2stream(arr[:,inst,:], duration)
+        p = partarr2stream(arr[:,inst,:], duration, stream=music21.stream.Part())
         stream.append(p)
     stream = stream.transpose(0)
     return stream
 
-# 2b.
-def partarr2stream(partarr, duration):
+# 3b.
+def partarr2stream(part, duration, stream=None):
     "convert instrument part to music21 chords"
-    part = music21.stream.Part()
-    part.append(music21.instrument.Piano())
-    part_append_duration_notes(partarr, duration, part) # notes already have duration calculated
+    if stream is None: stream = music21.stream.Stream()
+    stream.append(music21.instrument.Piano())
+    if np.any(part > 0): part_append_duration_notes(part, duration, stream) # notes already have duration calculated
+    else: part_append_continuous_notes(part, duration, stream) # notes are either start or continued 
 
-    return part
+    return stream
 
-def part_append_duration_notes(partarr, duration, stream):
+# 3b
+def part_append_continuous_notes(part, duration, stream):
+    starts = part == VALTSTART
+    durations = calc_note_durations(part)
+    for tidx,t in enumerate(starts):
+        note_idxs = np.where(t < 0)[0]
+        if len(note_idxs) == 0: continue
+        notes = []
+        for nidx in note_idxs:
+            note = music21.note.Note(nidx)
+            tnext = durations[tidx+1,nidx] if tidx+1 < len(part) else 0
+            note.duration = music21.duration.Duration((tnext+1)*duration.quarterLength)
+            notes.append(note)
+        for g in group_notes_by_duration(notes):
+            chord = music21.chord.Chord(g)
+            stream.insert(tidx*duration.quarterLength, chord)
+    return stream
+        
+# 3c.
+def calc_note_durations(part):
+    "calculate midi note durations from TCONT notes"
+    cnotes = (part == VALTCONT).astype(int)
+    for i in reversed(range(cnotes.shape[0]-1)):
+        cnotes[i] += cnotes[i+1]*cnotes[i]
+    return cnotes
+
+# 3alt.
+def part_append_duration_notes(part, duration, stream=None):
     "convert instrument part to music21 chords"
-    for tidx,t in enumerate(partarr):
+    for tidx,t in enumerate(part):
         note_idxs = np.where(t > 0)[0] # filter out any negative values (continuous mode)
         if len(note_idxs) == 0: continue
         notes = []
         for nidx in note_idxs:
             note = music21.note.Note(nidx)
-            note.duration = music21.duration.Duration(partarr[tidx,nidx]*duration.quarterLength)
+            note.duration = music21.duration.Duration(part[tidx,nidx]*duration.quarterLength)
             notes.append(note)
         for g in group_notes_by_duration(notes):
-            if len(g) == 1:
-                stream.insert(tidx*duration.quarterLength, g[0])
-            else:
-                chord = music21.chord.Chord(g)
-                stream.insert(tidx*duration.quarterLength, chord)
+            chord = music21.chord.Chord(g)
+            stream.insert(tidx*duration.quarterLength, chord)
     return stream
 
 from itertools import groupby
@@ -190,113 +271,77 @@ def group_notes_by_duration(notes):
     notes = sorted(notes, key=keyfunc)
     return [list(g) for k,g in groupby(notes, keyfunc)]
 
-
-# Midi -> npenc Conversion helpers
-def is_valid_npenc(npenc, note_range=PIANO_RANGE, max_dur=DUR_SIZE, 
-                   min_notes=32, input_path=None, verbose=True):
-    if len(npenc) < min_notes:
-        if verbose: print('Sequence too short:', len(npenc), input_path)
-        return False
-    if (npenc[:,1] >= max_dur).any(): 
-        if verbose: print(f'npenc exceeds max {max_dur} duration:', npenc[:,1].max(), input_path)
-        return False
-    # https://en.wikipedia.org/wiki/Scientific_pitch_notation - 88 key range - 21 = A0, 108 = C8
-    if ((npenc[...,0] > VALTSEP) & ((npenc[...,0] < note_range[0]) | (npenc[...,0] >= note_range[1]))).any(): 
-        print(f'npenc out of piano note range {note_range}:', input_path)
-        return False
-    return True
-
-# seperates overlapping notes to different tracks
-def remove_overlaps(stream, separate_chords=True):
-    if not separate_chords:
-        return stream.flat.makeVoices().voicesToParts()
-    return separate_melody_chord(stream)
-
-# seperates notes and chords to different tracks
-def separate_melody_chord(stream):
-    new_stream = music21.stream.Score()
-    if stream.timeSignature: new_stream.append(stream.timeSignature)
-    new_stream.append(stream.metronomeMarkBoundaries()[0][-1])
-    if stream.keySignature: new_stream.append(stream.keySignature)
+# saving
+def save_chordarr(out_file, chordarr):
+    sparse_matrix = scipy.sparse.csc_matrix(chordarr.reshape(chordarr.shape[0], -1))
+    scipy.sparse.save_npz(out_file, sparse_matrix)
     
-    melody_part = music21.stream.Part(stream.flat.getElementsByClass('Note'))
-    melody_part.insert(0, stream.getInstrument())
-    chord_part = music21.stream.Part(stream.flat.getElementsByClass('Chord'))
-    chord_part.insert(0, stream.getInstrument())
-    new_stream.append(melody_part)
-    new_stream.append(chord_part)
-    return new_stream
+def load_chordarr(file):
+    sparse_matrix = scipy.sparse.load_npz(file)
+    np_arr = np.array(sparse_matrix.todense())
+    return np_arr.reshape((np_arr.shape[0], -1, 127))
 
-# processing functions for sanitizing data
 
-def compress_chordarr(chordarr):
-    return shorten_chordarr_rests(trim_chordarr_rests(chordarr))
 
-def trim_chordarr_rests(arr, max_rests=4, sample_freq=SAMPLE_FREQ):
-    # max rests is in quarter notes
-    # max 1 bar between song start and end
-    start_idx = 0
-    max_sample = max_rests*sample_freq
-    for idx,t in enumerate(arr):
-        if (t != 0).any(): break
-        start_idx = idx+1
-        
-    end_idx = 0
-    for idx,t in enumerate(reversed(arr)):
-        if (t != 0).any(): break
-        end_idx = idx+1
-    start_idx = start_idx - start_idx % max_sample
-    end_idx = end_idx - end_idx % max_sample
-#     if start_idx > 0 or end_idx > 0: print('Trimming rests. Start, end:', start_idx, len(arr)-end_idx, end_idx)
-    return arr[start_idx:(len(arr)-end_idx)]
+# npenc functions
 
-def shorten_chordarr_rests(arr, max_rests=8, sample_freq=SAMPLE_FREQ):
-    # max rests is in quarter notes
-    # max 2 bar pause
-    rest_count = 0
+def npenc2stream(arr, bpm=120):
+    "Converts numpy encoding to music21 stream"
+    seq = npenc2seq(np.array(arr))
+    chordarr = seq2chordarr(seq)
+    return chordarr2stream(chordarr, bpm=bpm)
+
+def midi2npenc(midi_file, midi_source=None):
+    "Converts midi file to numpy encoding for language model"
+    stream = file2stream(midi_file) # 1.
+    s_arr = stream2chordarr(stream) # 2.
+    seq = chordarr2seq(s_arr) # 3.
+    return seq2npenc(seq)
+
+# 4.
+def npenc_func(n, num_comps=2):
+    if num_comps == 2: return [n.pitch.midi, n.dur]
+    raise ValueError('Unhandled number of components')
+
+def seq2npenc(seq):
+    "Note function returns a list of note components for separation"
     result = []
-    max_sample = max_rests*sample_freq
-    for timestep in arr:
-        if (timestep==0).all(): 
-            rest_count += 1
+    wait_count = 1
+    for idx,timestep in enumerate(seq):
+        flat_time = [npenc_func(n) for n in timestep if n.pitch.octave and n.dur > 0]
+        if len(flat_time) == 0:
+            wait_count += 1
         else:
-            if rest_count > max_sample:
-#                 old_count = rest_count
-                rest_count = (rest_count % sample_freq) + max_sample
-#                 print(f'Compressing rests: {old_count} -> {rest_count}')
-            for i in range(rest_count): result.append(np.zeros(timestep.shape))
-            rest_count = 0
-            result.append(timestep)
-    for i in range(rest_count): result.append(np.zeros(timestep.shape))
-    return np.array(result)
+            # pitch, octave, duration, instrument
+            result.append([VALTSEP, wait_count])
+            result.extend(flat_time)
+            wait_count = 1
+    return np.array(result, dtype=int)
 
-# sequence 2 sequence convenience functions
+def npdec_func(step):
+    n,d,o,i = pad_array(step, 0, final_length=4)
+    return NoteEnc(n+o*12,d,i)
+    
+def npenc2seq(npenc, dec_func=npdec_func):
+    seq = []
+    tstep = []
+    npenc = npenc.copy()
+    for x in npenc:
+        n,d = x[:2]
+        if n < VALTSEP: continue # special tokens
+        if n == VALTSEP: 
+            if len(tstep) > 0: seq.append(tstep) # add notes if they exists
+            tstep = []
+            for i in range(1, d): seq.append([])
+        else:
+            if d == 0: 
+                print('Note with 0 duration. continuing')
+                continue
+            tstep.append(dec_func(x))
+    if len(tstep) > 0: seq.append(tstep)
+    return seq
 
-def stream2npenc_parts(stream, sort_pitch=True):
-    chordarr = stream2chordarr(stream)
-    _,num_parts,_ = chordarr.shape
-    parts = [part_enc(chordarr, i) for i in range(num_parts)]
-    return sorted(parts, key=avg_pitch, reverse=True) if sort_pitch else parts
-
-def chordarr_combine_parts(parts):
-    max_ts = max([p.shape[0] for p in parts])
-    parts_padded = [pad_part_to(p, max_ts) for p in parts]
-    chordarr_comb = np.concatenate(parts_padded, axis=1)
-    return chordarr_comb
-
-def pad_part_to(p, target_size):
-    pad_width = ((0,target_size-p.shape[0]),(0,0),(0,0))
-    return np.pad(p, pad_width, 'constant')
-
-def part_enc(chordarr, part):
-    partarr = chordarr[:,part:part+1,:]
-    npenc = chordarr2npenc(partarr)
-    return npenc
-
-def avg_tempo(t, sep_idx=VALTSEP):
-    avg = t[t[:, 0] == sep_idx][:, 1].sum()/t.shape[0]
-    avg = int(round(avg/SAMPLE_FREQ))
-    return 'mt'+str(min(avg, MTEMPO_SIZE-1))
-
-def avg_pitch(t, sep_idx=VALTSEP):
-    return t[t[:, 0] > sep_idx][:, 0].mean()
+def pad_array(arr, fill_value, final_length):
+    if isinstance(arr, np.ndarray): arr = arr.tolist()
+    padding = [fill_value] * max(0, final_length - len(arr))
+    return arr+padding
